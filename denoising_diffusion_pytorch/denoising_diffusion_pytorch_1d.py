@@ -1,3 +1,5 @@
+# https://github.com/lucidrains/denoising-diffusion-pytorch
+
 import math
 from pathlib import Path
 from random import random
@@ -15,12 +17,7 @@ from torch.utils.data import Dataset, DataLoader
 from einops import rearrange, reduce
 from einops.layers.torch import Rearrange
 
-from accelerate import Accelerator
-from ema_pytorch import EMA
-
 from tqdm.auto import tqdm
-
-from denoising_diffusion_pytorch.version import __version__
 
 # constants
 
@@ -68,19 +65,6 @@ def normalize_to_neg_one_to_one(img):
 def unnormalize_to_zero_to_one(t):
     return (t + 1) * 0.5
 
-# data
-
-class Dataset1D(Dataset):
-    def __init__(self, tensor: Tensor):
-        super().__init__()
-        self.tensor = tensor.clone()
-
-    def __len__(self):
-        return len(self.tensor)
-
-    def __getitem__(self, idx):
-        return self.tensor[idx].clone()
-
 # small helper modules
 
 class Residual(nn.Module):
@@ -97,8 +81,20 @@ def Upsample(dim, dim_out = None):
         nn.Conv1d(dim, default(dim_out, dim), 3, padding = 1)
     )
 
-def Downsample(dim, dim_out = None):
-    return nn.Conv1d(dim, default(dim_out, dim), 4, 2, 1)
+#def Downsample(dim, dim_out = None):
+#    return nn.Conv1d(dim, default(dim_out, dim), 4, 2, 1) # kernel, stride, padding (stride=2 does the downsample)
+
+class Downsample(nn.Module):
+    def __init__(self, dim, dim_out = None):
+        super().__init__()
+        self.conv = nn.Conv1d(dim, default(dim_out, dim), 4, 2, 1)
+
+    def forward(self, x): 
+        """ Pad x if its length is odd so we don't lose sequence context """
+        
+        if x.shape[2] % 2 == 1: 
+            x = F.pad(x, (0,1))
+        return self.conv(x)
 
 class RMSNorm(nn.Module):
     def __init__(self, dim):
@@ -131,7 +127,7 @@ class SinusoidalPosEmb(nn.Module):
         half_dim = self.dim // 2
         emb = math.log(self.theta) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
+        emb = x[:, None] * emb[None, :] # multiplication not addition?!
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
@@ -162,6 +158,7 @@ class Block(nn.Module):
         self.act = nn.SiLU()
 
     def forward(self, x, scale_shift = None):
+        # the influence of the time embedding comes through scale_shift
         x = self.proj(x)
         x = self.norm(x)
 
@@ -190,7 +187,7 @@ class ResnetBlock(nn.Module):
         if exists(self.mlp) and exists(time_emb):
             time_emb = self.mlp(time_emb)
             time_emb = rearrange(time_emb, 'b c -> b c 1')
-            scale_shift = time_emb.chunk(2, dim = 1)
+            scale_shift = time_emb.chunk(2, dim = 1) # split into a list of two tensors
 
         h = self.block1(x, scale_shift = scale_shift)
 
@@ -199,6 +196,9 @@ class ResnetBlock(nn.Module):
         return h + self.res_conv(x)
 
 class LinearAttention(nn.Module):
+    # ala Linformer
+    # lucidrain's notes say this only works for fixed seq length, not sure why? 
+    
     def __init__(self, dim, heads = 4, dim_head = 32):
         super().__init__()
         self.scale = dim_head ** -0.5
@@ -219,8 +219,8 @@ class LinearAttention(nn.Module):
         q = q.softmax(dim = -2)
         k = k.softmax(dim = -1)
 
-        q = q * self.scale        
-
+        q = q * self.scale
+            
         context = torch.einsum('b h d n, b h e n -> b h d e', k, v)
 
         out = torch.einsum('b h d e, b h d n -> b h e n', context, q)
@@ -244,9 +244,9 @@ class Attention(nn.Module):
 
         q = q * self.scale
 
-        sim = einsum('b h d i, b h d j -> b h i j', q, k)
+        sim = torch.einsum('b h d i, b h d j -> b h i j', q, k)
         attn = sim.softmax(dim = -1)
-        out = einsum('b h i j, b h d j -> b h i d', attn, v)
+        out = torch.einsum('b h i j, b h d j -> b h i d', attn, v)
 
         out = rearrange(out, 'b h n d -> b (h d) n')
         return self.to_out(out)
@@ -257,13 +257,13 @@ class Unet1D(nn.Module):
     def __init__(
         self,
         dim,
-        init_dim = None,
-        out_dim = None,
-        dim_mults=(1, 2, 4, 8),
-        channels = 3,
-        self_condition = False,
+        init_dim = None, # dimension of initial embedding, defaults to dim
+        out_dim = None, # dimension of output, defaults to channels * (1 if not learned_variance else 2)
+        dim_mults=(1, 2, 4, 8), # channels multiplier and number of layers in Unet
+        channels = 3, # data input channels
+        self_condition = False, 
         resnet_block_groups = 8,
-        learned_variance = False,
+        learned_variance = False, # learn variance of output
         learned_sinusoidal_cond = False,
         random_fourier_features = False,
         learned_sinusoidal_dim = 16,
@@ -371,7 +371,10 @@ class Unet1D(nn.Module):
         x = self.mid_block2(x, t)
 
         for block1, block2, attn, upsample in self.ups:
-            x = torch.cat((x, h.pop()), dim = 1)
+            residual = h.pop()
+            if residual.shape[2] < x.shape[2]: # this can happen if x was padded in DownSample
+                x = x[:,:,:-1] # trim last position
+            x = torch.cat((x, residual), dim = 1)
             x = block1(x, t)
 
             x = torch.cat((x, h.pop()), dim = 1)
@@ -379,7 +382,9 @@ class Unet1D(nn.Module):
             x = attn(x)
 
             x = upsample(x)
-
+        
+        if r.shape[2] < x.shape[2]: 
+            x = x[:,:,:-1]
         x = torch.cat((x, r), dim = 1)
 
         x = self.final_res_block(x, t)
@@ -505,18 +510,25 @@ class GaussianDiffusion1D(nn.Module):
         self.unnormalize = unnormalize_to_zero_to_one if auto_normalize else identity
 
     def predict_start_from_noise(self, x_t, t, noise):
+        """ All these "predict" functions start from eq 4 in DDPM
+        Under the forward process q
+        x_t = sqrt_alpha_cumprod[t] * x_start + sqrt_one_minus_alphas_cumprod[t] * noise
+        Solving for x_start gives
+        x_start = sqrt_recip_alphas_cumprod[t] * x_t - sqrt_recipm1_alphas_cumprod[t] * noise
+        """
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
 
     def predict_noise_from_start(self, x_t, t, x0):
+        """ Solving for noise gives this """ 
         return (
             (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) / \
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
         )
 
-    def predict_v(self, x_start, t, noise):
+    def predict_v(self, x_start, t, noise): # what is v? 
         return (
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * noise -
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_start
@@ -529,6 +541,7 @@ class GaussianDiffusion1D(nn.Module):
         )
 
     def q_posterior(self, x_start, x_t, t):
+        """ Get posterior q(x_{t-1}|x_start,x_t) i.e. eq (6) from DDPM paper """
         posterior_mean = (
             extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
             extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
@@ -538,12 +551,13 @@ class GaussianDiffusion1D(nn.Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
+        """ Get noise (epsilon) and mean(x_0) given x_t """ 
         model_output = self.model(x, t, x_self_cond)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
-        if self.objective == 'pred_noise':
-            pred_noise = model_output
-            x_start = self.predict_start_from_noise(x, t, pred_noise)
+        if self.objective == 'pred_noise': # this seems to be the recommended approach
+            pred_noise = model_output # note "noise" here is the total noise mixed into x_start to get x_t
+            x_start = self.predict_start_from_noise(x, t, pred_noise) # given x_t and this noise what was x_start? 
             x_start = maybe_clip(x_start)
 
             if clip_x_start and rederive_pred_noise:
@@ -563,41 +577,54 @@ class GaussianDiffusion1D(nn.Module):
         return ModelPrediction(pred_noise, x_start)
 
     def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True):
+        """ Posterior p(x_(t-1)|x_t) in the reverse process (not conditional on x_0) """ 
+
+        # for pred_noise
+        # x_start = sqrt_recip_alphas_cumprod[t] * x_t - sqrt_recipm1_alphas_cumprod[t] * eps(x_t,t)
         preds = self.model_predictions(x, t, x_self_cond)
         x_start = preds.pred_x_start
 
         if clip_denoised:
             x_start.clamp_(-1., 1.)
 
+        # brownian bridge at x_(t-1) given x_t and sampled x_0 to take a step in the sampling process
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
     def p_sample(self, x, t: int, x_self_cond = None, clip_denoised = True):
+        """ Sample p(x_(t-1)|x_t), i.e. one step of p_sample_loop
+
+        Not obvious to me that this matches algo 2 from DDPM, which is
+        x_(t-1) = recip_sqrt_alpha_t (x_t - frac{1-alpha_t}{sqrt{1-alpha_cumprod_t}} eps(x_t,t) ) + sigma_t z
+        
+        """
         b, *_, device = *x.shape, x.device
         batched_times = torch.full((b,), t, device = x.device, dtype = torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = clip_denoised)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
-        pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
-        return pred_img, x_start
+        x_tm1 = model_mean + (0.5 * model_log_variance).exp() * noise # sigma_t z added to x 
+        return x_tm1, x_start
 
     @torch.no_grad()
     def p_sample_loop(self, shape):
+        """ Algo 2 in DDPM paper """ 
+
         batch, device = shape[0], self.betas.device
 
-        img = torch.randn(shape, device=device)
+        x = torch.randn(shape, device=device) # sample x_T 
 
         x_start = None
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, self_cond)
-
-        img = self.unnormalize(img)
-        return img
+            x, x_start = self.p_sample(x, t, self_cond)
+        
+        return self.unnormalize(img) # optionally map from [-1,1] to [0,1]
 
     @torch.no_grad()
     def ddim_sample(self, shape, clip_denoised = True):
+        """ Denoising Diffusion Implicit Models """ 
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -634,6 +661,9 @@ class GaussianDiffusion1D(nn.Module):
 
     @torch.no_grad()
     def sample(self, batch_size = 16):
+        """ Unconditional sampling from the model
+        DDIM is used if self.is_ddim_sampling is True, which is the case if sampling_timesteps < training timesteps
+        (by default they are equal so DDIM is NOT used) """
         seq_length, channels = self.seq_length, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         return sample_fn((batch_size, channels, seq_length))
@@ -660,6 +690,9 @@ class GaussianDiffusion1D(nn.Module):
 
     @autocast(enabled = False)
     def q_sample(self, x_start, t, noise=None):
+        """ Sample q(x_t|x_start) with optionally specified noise epsilon
+        This corresponds to equation 4 from the DDPM paper
+        """
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         return (
@@ -672,13 +705,11 @@ class GaussianDiffusion1D(nn.Module):
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         # noise sample
-
         x = self.q_sample(x_start = x_start, t = t, noise = noise)
 
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
         # and condition with unet with that
         # this technique will slow down training by 25%, but seems to lower FID significantly
-
         x_self_cond = None
         if self.self_condition and random() < 0.5:
             with torch.no_grad():
@@ -686,7 +717,6 @@ class GaussianDiffusion1D(nn.Module):
                 x_self_cond.detach_()
 
         # predict and take gradient step
-
         model_out = self.model(x, t, x_self_cond)
 
         if self.objective == 'pred_noise':

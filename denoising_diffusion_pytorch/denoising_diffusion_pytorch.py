@@ -92,11 +92,23 @@ def Upsample(dim, dim_out = None):
         nn.Conv2d(dim, default(dim_out, dim), 3, padding = 1)
     )
 
-def Downsample(dim, dim_out = None):
+def Downsample_og(dim, dim_out = None):
     return nn.Sequential(
         Rearrange('b c (h p1) (w p2) -> b (c p1 p2) h w', p1 = 2, p2 = 2),
         nn.Conv2d(dim * 4, default(dim_out, dim), 1)
     )
+
+
+class Downsample(nn.Module):
+    def __init__(self, dim, dim_out = None):
+        super().__init__()
+        self.conv = Downsample_og(dim, dim_out = dim_out)
+
+    def forward(self, x): 
+        """ Pad x if its length is odd so we don't lose sequence context """        
+        if x.shape[-1] % 2 == 1: 
+            x = F.pad(x, (0,1,0,1))
+        return self.conv(x)
 
 class RMSNorm(nn.Module):
     def __init__(self, dim):
@@ -385,7 +397,7 @@ class Unet(nn.Module):
         return 2 ** (len(self.downs) - 1)
 
     def forward(self, x, time, x_self_cond = None):
-        assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
+        #assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
 
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
@@ -413,7 +425,10 @@ class Unet(nn.Module):
         x = self.mid_block2(x, t)
 
         for block1, block2, attn, upsample in self.ups:
-            x = torch.cat((x, h.pop()), dim = 1)
+            residual = h.pop()
+            if residual.shape[-1] < x.shape[-1]: # this can happen if x was padded in DownSample
+                x = x[:,:,:-1,:-1] # trim
+            x = torch.cat((x, residual), dim = 1)
             x = block1(x, t)
 
             x = torch.cat((x, h.pop()), dim = 1)
@@ -421,7 +436,9 @@ class Unet(nn.Module):
             x = attn(x) + x
 
             x = upsample(x)
-
+            
+        if r.shape[-1] < x.shape[-1]: # this can happen if x was padded in DownSample
+            x = x[:,:,:-1,:-1] # trim
         x = torch.cat((x, r), dim = 1)
 
         x = self.final_res_block(x, t)
@@ -590,12 +607,19 @@ class GaussianDiffusion(nn.Module):
         return self.betas.device
 
     def predict_start_from_noise(self, x_t, t, noise):
+        """ All these "predict" functions start from eq 4 in DDPM
+        Under the forward process q
+        x_t = sqrt_alpha_cumprod[t] * x_start + sqrt_one_minus_alphas_cumprod[t] * noise
+        Solving for x_start gives
+        x_start = sqrt_recip_alphas_cumprod[t] * x_t - sqrt_recipm1_alphas_cumprod[t] * noise
+        """
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
 
     def predict_noise_from_start(self, x_t, t, x0):
+        """ Solving for noise gives this """ 
         return (
             (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) / \
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
@@ -614,6 +638,7 @@ class GaussianDiffusion(nn.Module):
         )
 
     def q_posterior(self, x_start, x_t, t):
+        """ Get posterior q(x_{t-1}|x_start,x_t) i.e. eq (6) from DDPM paper """
         posterior_mean = (
             extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
             extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
@@ -623,6 +648,7 @@ class GaussianDiffusion(nn.Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
+        """ Get noise (epsilon) and mean(x_0) given x_t """ 
         model_output = self.model(x, t, x_self_cond)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
@@ -648,6 +674,7 @@ class GaussianDiffusion(nn.Module):
         return ModelPrediction(pred_noise, x_start)
 
     def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True):
+        """ Posterior p(x_(t-1)|x_t) in the reverse process (not conditional on x_0) """ 
         preds = self.model_predictions(x, t, x_self_cond)
         x_start = preds.pred_x_start
 
@@ -659,6 +686,12 @@ class GaussianDiffusion(nn.Module):
 
     @torch.inference_mode()
     def p_sample(self, x, t: int, x_self_cond = None):
+        """ Sample p(x_(t-1)|x_t), i.e. one step of p_sample_loop
+
+        Not obvious to me that this matches algo 2 from DDPM, which is
+        x_(t-1) = recip_sqrt_alpha_t (x_t - frac{1-alpha_t}{sqrt{1-alpha_cumprod_t}} eps(x_t,t) ) + sigma_t z
+        
+        """
         b, *_, device = *x.shape, self.device
         batched_times = torch.full((b,), t, device = device, dtype = torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
@@ -677,7 +710,38 @@ class GaussianDiffusion(nn.Module):
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, self_cond)
+            img, x_start = self.p_sample(img, t, self_cond) 
+            imgs.append(img)
+
+        ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
+
+        ret = self.unnormalize(ret)
+        return ret
+
+    @torch.inference_mode()
+    def p_conditional_sample_loop(self, x_fixed, U = 1, return_all_timesteps = False):
+
+        x_fixed = self.normalize(x_fixed)
+        
+        img = torch.randn_like(x_fixed)
+        imgs = [img]
+
+        x_start = None
+
+        mask = ~x_fixed.isnan()
+
+        for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
+            self_cond = x_start if self.self_condition else None
+            for u in range(U): 
+                # beta_t is the variance going from x_(t-1) to x_t i.e. q(x_t|x_(t-1)) = sqrt(1-beta_t) x_(t-1) + beta_t randn
+                # img at this point is x_t
+                img, x_start = self.p_sample(img, t, self_cond) # img is x_(t-1)
+                batched_times = torch.full((x_fixed.shape[0],), t, device = x_fixed.device, dtype = torch.long)
+                img_known = self.q_sample(x_fixed, batched_times) # should be ok with the Nans? 
+                img[mask] = img_known[mask] # does this handle t=0 correctly? 
+                if u < (U-1): # only do this if not the last iteration of u
+                    img = img * torch.sqrt(1. - self.betas[t]) + torch.sqrt(self.betas[t]) * torch.randn_like(x_fixed)
+            
             imgs.append(img)
 
         ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
@@ -857,11 +921,10 @@ class Trainer(object):
     def __init__(
         self,
         diffusion_model,
-        folder,
+        dataset,
         *,
         train_batch_size = 16,
         gradient_accumulate_every = 1,
-        augment_horizontal_flip = True,
         train_lr = 1e-4,
         train_num_steps = 100000,
         ema_update_every = 10,
@@ -873,12 +936,12 @@ class Trainer(object):
         amp = False,
         mixed_precision_type = 'fp16',
         split_batches = True,
-        convert_image_to = None,
         calculate_fid = True,
         inception_block_idx = 2048,
         max_grad_norm = 1.,
         num_fid_samples = 50000,
-        save_best_and_latest_only = False
+        save_best_and_latest_only = False,
+        num_workers = None
     ):
         super().__init__()
 
@@ -894,11 +957,6 @@ class Trainer(object):
         self.model = diffusion_model
         self.channels = diffusion_model.channels
         is_ddim_sampling = diffusion_model.is_ddim_sampling
-
-        # default convert_image_to depending on channels
-
-        if not exists(convert_image_to):
-            convert_image_to = {1: 'L', 3: 'RGB', 4: 'RGBA'}.get(self.channels)
 
         # sampling and training hyperparameters
 
@@ -917,11 +975,17 @@ class Trainer(object):
 
         # dataset and dataloader
 
-        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        self.ds = dataset
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 
-        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+        dl = DataLoader(
+            self.ds, 
+            batch_size = train_batch_size, 
+            shuffle = True, 
+            pin_memory = True, 
+            num_workers = default(num_workers, cpu_count())
+        )
 
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
@@ -937,7 +1001,7 @@ class Trainer(object):
             self.ema.to(self.device)
 
         self.results_folder = Path(results_folder)
-        self.results_folder.mkdir(exist_ok = True)
+        self.results_folder.mkdir(parents = True, exist_ok = True)
 
         # step counter state
 
